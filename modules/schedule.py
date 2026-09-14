@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import datetime
 from database.connection import execute_query, execute_one, execute_update, execute_insert
 from utils.ui_components import render_status_pill
@@ -9,7 +10,7 @@ from modules.auth import log_audit
 
 def render_schedule(project: dict, user: dict):
     st.subheader("📅 Cronograma Físico & Visual de Etapas")
-    st.caption("Visão integrada de prazos, marcos contratuais e andamento em órgãos públicos.")
+    st.caption("Acompanhamento integrado de prazos, marcos contratuais e tramitações em órgãos públicos.")
 
     can_edit = user['role'] in ('admin', 'engineer')
 
@@ -23,21 +24,79 @@ def render_schedule(project: dict, user: dict):
     if not stages:
         st.info("Nenhuma etapa cadastrada no cronograma deste projeto.")
         if can_edit:
-            st.info("Utilize a ferramenta de administração para cadastrar as etapas.")
+            st.info("Utilize a aba de Gestão Administrativa para cadastrar as etapas.")
         return
 
-    # 1. Gráfico de Gantt Interativo (Plotly)
+    # 1. Resumo em Métricas no Topo
+    total_stages = len(stages)
+    completed_stages = sum(1 for s in stages if s['status'] == 'concluido')
+    in_progress_stages = sum(1 for s in stages if s['status'] in ('em_andamento', 'em_analise_orgao'))
+    pending_stages = sum(1 for s in stages if s['status'] == 'a_iniciar')
+    
+    # Calcular dias restantes até a entrega
+    end_date_str = project.get('end_date_estimated')
+    days_left_txt = "N/A"
+    if end_date_str:
+        try:
+            end_d = datetime.datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            diff = (end_d - datetime.date.today()).days
+            days_left_txt = f"{diff} dias" if diff >= 0 else f"{abs(diff)} dias em atraso"
+        except Exception:
+            pass
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("Total de Etapas", f"{total_stages} fases")
+    with k2:
+        st.metric("Etapas Concluídas", f"{completed_stages} de {total_stages}", f"{(completed_stages/total_stages)*100:.0f}% concluído")
+    with k3:
+        st.metric("Em Andamento / Análise", f"{in_progress_stages} fases")
+    with k4:
+        st.metric("Prazo Restante", days_left_txt, f"Entrega: {end_date_str}")
+
+    st.markdown("<div style='margin-bottom: 1rem;'></div>", unsafe_allow_html=True)
+
+    # 2. Gráfico de Gantt Interativo e Otimizado para Qualquer Tema (Dark e Light)
     df_stages = []
+    status_labels = {
+        'concluido': 'Concluído (100%)',
+        'em_andamento': 'Em Andamento',
+        'em_analise_orgao': 'Em Análise no Órgão',
+        'a_iniciar': 'A Iniciar',
+        'atrasado': 'Atrasado'
+    }
+
+    color_map = {
+        'Concluído (100%)': '#10B981',     # Verde Esmeralda
+        'Em Andamento': '#3B82F6',         # Azul Safira
+        'Em Análise no Órgão': '#F59E0B',  # Âmbar Dourado
+        'A Iniciar': '#64748B',            # Cinza Ardósia
+        'Atrasado': '#EF4444'              # Vermelho Alerta
+    }
+
     for s in stages:
         s_date = s['start_date'] or datetime.date.today().strftime('%Y-%m-%d')
         e_date = s['end_date'] or s_date
+        stt_label = status_labels.get(s['status'], s['status'].title())
+        prog_val = float(s['progress_percent'] or 0.0)
+        
+        # Formatar texto da barra
+        bar_text = f" {prog_val:.0f}%" if prog_val > 0 else " 0%"
+        
         df_stages.append({
-            'Etapa': s['stage_name'],
+            'ID': s['id'],
+            'Ordem': s['order_index'],
+            'Etapa': f"{s['order_index']}. {s['stage_name']}",
+            'NomePuro': s['stage_name'],
             'Início': s_date,
             'Término': e_date,
-            'Progresso (%)': s['progress_percent'],
-            'Status': s['status'].replace('_', ' ').title(),
-            'Tipo': s['stage_type'].title()
+            'Progresso': f"{prog_val:.0f}%",
+            'ProgressoNum': prog_val,
+            'Status': stt_label,
+            'Tipo': s['stage_type'].title(),
+            'Órgão': s['agency_name'] or 'Canteiro / Interno',
+            'Protocolo': s['protocol_number'] or 'N/A',
+            'TextoBarra': f"{s['stage_name']} ({prog_val:.0f}%)"
         })
 
     df = pd.DataFrame(df_stages)
@@ -49,32 +108,67 @@ def render_schedule(project: dict, user: dict):
             x_end="Término",
             y="Etapa",
             color="Status",
-            color_discrete_map={
-                'Concluido': '#10B981',
-                'Em Andamento': '#3B82F6',
-                'Em Analise Orgao': '#F59E0B',
-                'A Iniciar': '#9CA3AF',
-                'Atrasado': '#EF4444'
+            color_discrete_map=color_map,
+            hover_data={
+                'Etapa': False,
+                'Início': True,
+                'Término': True,
+                'Progresso': True,
+                'Status': True,
+                'Tipo': True,
+                'Órgão': True,
+                'Protocolo': True
             },
-            title=f"Linha do Tempo de Execução • {project['title']}",
-            hover_data=['Progresso (%)', 'Tipo']
+            text="Progresso"
         )
-        fig.update_yaxes(autorange="reversed")
+        
+        fig.update_yaxes(
+            autorange="reversed",
+            title=None,
+            tickfont=dict(size=12, color="#E2E8F0"),
+            gridcolor="rgba(148, 163, 184, 0.15)"
+        )
+        
+        fig.update_xaxes(
+            title=None,
+            tickfont=dict(size=11, color="#E2E8F0"),
+            gridcolor="rgba(148, 163, 184, 0.15)",
+            showgrid=True
+        )
+
+        fig.update_traces(
+            textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(color="#FFFFFF", size=11, family="Arial Black, Arial, sans-serif"),
+            marker=dict(line=dict(width=1, color="rgba(255,255,255,0.3)"))
+        )
+
         fig.update_layout(
-            height=320 + (len(stages) * 25),
-            margin=dict(l=20, r=20, t=50, b=20),
-            font=dict(family="Arial, sans-serif", size=12),
-            plot_bgcolor="#FAFAFA",
-            paper_bgcolor="#FFFFFF"
+            height=280 + (len(stages) * 35),
+            margin=dict(l=10, r=20, t=30, b=20),
+            font=dict(family="Arial, sans-serif", size=12, color="#E2E8F0"),
+            plot_bgcolor="rgba(15, 23, 42, 0.6)",
+            paper_bgcolor="rgba(15, 23, 42, 0.85)",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+                font=dict(size=11, color="#E2E8F0"),
+                bgcolor="rgba(15, 23, 42, 0.5)",
+                bordercolor="rgba(148, 163, 184, 0.3)",
+                borderwidth=1
+            )
         )
         st.plotly_chart(fig, use_container_width=True)
     except Exception as e:
-        st.warning(f"Não foi possível gerar a linha do tempo gráfica: {e}")
+        st.warning(f"Erro ao renderizar gráfico Gantt: {e}")
 
     st.markdown("---")
 
-    # 2. Detalhamento de cada Etapa
-    st.markdown("### 📌 Detalhamento e Status por Etapa")
+    # 3. Detalhamento e Atualização das Etapas
+    st.markdown("### 📌 Detalhamento de Cada Etapa & Ações")
 
     for s in stages:
         with st.container():
@@ -86,29 +180,28 @@ def render_schedule(project: dict, user: dict):
                 agency_info = f"🏛️ <strong>Órgão:</strong> {s['agency_name'] or 'N/A'} • 📄 <strong>Protocolo:</strong> <code>{s['protocol_number'] or 'N/A'}</code> • "
 
             st.html(f"""
-            <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem; margin-bottom: 0.8rem;">
+            <div style="background: rgba(30, 41, 59, 0.5); border: 1px solid #334155; border-radius: 8px; padding: 1.1rem; margin-bottom: 0.8rem;">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
                     <div>
-                        <strong style="color: #0F2D59; font-size: 1.05rem;">{s['order_index']}. {s['stage_name']}</strong>
+                        <strong style="color: #FFFFFF; font-size: 1.05rem;">{s['order_index']}. {s['stage_name']}</strong>
                     </div>
                     <div>
                         {st_pill}
                     </div>
                 </div>
-                <div style="font-size: 0.82rem; color: #64748B; margin-top: 4px;">
-                    {agency_info}📅 <strong>Período:</strong> {s['start_date']} até {s['end_date']}
+                <div style="font-size: 0.82rem; color: #94A3B8; margin-top: 6px;">
+                    {agency_info}📅 <strong>Período Previsto:</strong> {s['start_date']} até {s['end_date']}
                 </div>
-                <div style="margin-top: 6px; font-size: 0.86rem; color: #334155;">
-                    {s['description'] or 'Sem descrição detalhada.'}
+                <div style="margin-top: 6px; font-size: 0.88rem; color: #CBD5E1;">
+                    {s['description'] or 'Sem descrição complementar.'}
                 </div>
             </div>
             """)
 
             st.progress(prog / 100.0)
 
-            # Se for Engenheiro ou Admin, permitir atualização rápida
             if can_edit:
-                with st.expander(f"✏️ Atualizar Etapa: {s['stage_name']}", expanded=False):
+                with st.expander(f"✏️ Atualizar Progresso: {s['stage_name']}", expanded=False):
                     with st.form(f"form_stage_{s['id']}"):
                         sc1, sc2 = st.columns(2)
                         with sc1:
